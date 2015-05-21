@@ -1,5 +1,22 @@
 #!/usr/bin/perl
 
+# Copyright (c) 2000, 2010, Oracle and/or its affiliates. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Library General Public
+# License as published by the Free Software Foundation; version 2
+# of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Library General Public License for more details.
+#
+# You should have received a copy of the GNU Library General Public
+# License along with this library; if not, write to the Free
+# Software Foundation, Inc., 51 Franklin St, Fifth Floor, Boston,
+# MA 02110-1301, USA
+
 use strict;
 use Getopt::Long;
 use Data::Dumper;
@@ -58,17 +75,18 @@ Usage: $0 db_name[./table_regex/] [new_db_name | directory]
   -h, --host=#         hostname for local server when connecting over TCP/IP
   -P, --port=#         port to use when connecting to local server with TCP/IP
   -S, --socket=#       socket to use when connecting to local server
+      --old_server     connect to old MySQL-server (before v5.5) which
+                       doesn't have FLUSH TABLES WITH READ LOCK fully implemented.
 
   --allowold           don\'t abort if target dir already exists (rename it _old)
   --addtodest          don\'t rename target dir if it exists, just add files to it
   --keepold            don\'t delete previous (now renamed) target when done
   --noindices          don\'t include full index files in copy
-   --method=cp         copy of data files will use standard OS cp
-   --method=rsync      copy of data files will use local rsync
+  --method=#           method for copy (only "cp" and "rsync" currently supported)
+  --method=rsync       copy of data files will use local rsync                                                                                                                                                  
                        to overwrite potentially existing files;
                        allowold and keepold become irrelevant.
                        added by mengwong(at)pobox.com 20010402
-
   -q, --quiet          be silent except for errors
   --debug              enable debug
   -n, --dryrun         report actions without doing them
@@ -79,7 +97,7 @@ Usage: $0 db_name[./table_regex/] [new_db_name | directory]
   --flushlog           flush logs once all tables are locked 
   --resetmaster        reset the binlog once all tables are locked
   --resetslave         reset the master.info once all tables are locked
-  --tmpdir=#	       temporary directory (instead of $opt_tmpdir)
+  --tmpdir=#         temporary directory (instead of $opt_tmpdir)
   --record_log_pos=#   record slave and master status in specified db.table
   --chroot=#           base directory of chroot jail in which mysqld operates
 
@@ -95,10 +113,10 @@ sub usage {
 # at all, the defaults will be used (login name, no password).
 
 my %opt = (
-    noindices	=> 0,
-    allowold	=> 0,	# for safety
-    keepold	=> 0,
-    method	=> "cp",
+    noindices => 0,
+    allowold  => 0, # for safety
+    keepold => 0,
+    method  => "cp",
     flushlog    => 0,
 );
 Getopt::Long::Configure(qw(no_ignore_case)); # disambiguate -p and -P
@@ -109,6 +127,7 @@ GetOptions( \%opt,
     "password|p=s",
     "port|P=s",
     "socket|S=s",
+    "old_server",
     "allowold!",
     "keepold!",
     "addtodest!",
@@ -144,6 +163,8 @@ GetOptions( \%opt,
 my @db_desc = ();
 my $tgt_name = undef;
 
+#print STDERR "Warning: $0 is deprecated and will be removed in a future version.\n";
+
 usage("") if ($opt{help});
 
 if ( $opt{regexp} || $opt{suffix} || @ARGV > 2 ) {
@@ -157,10 +178,10 @@ else {
     @db_desc = ( { 'src' => $ARGV[0], 't_regex' => ( $2 ? $2 : '.*' ) } );
 
     if ( @ARGV == 2 ) {
-	$tgt_name   = $ARGV[1];
+  $tgt_name   = $ARGV[1];
     }
     else {
-	$opt{suffix} = "_copy";
+  $opt{suffix} = "_copy";
     }
 }
 
@@ -169,7 +190,7 @@ my $start_time = time;
 $opt_tmpdir= $opt{tmpdir} if $opt{tmpdir};
 $0 = $1 if $0 =~ m:/([^/]+)$:;
 $opt{quiet} = 0 if $opt{debug};
-$opt{keepold} = 1 if $opt{method} eq "rsync";
+$opt{keepold} = 1 if $opt{method} eq "rsync";  
 $opt{allowold} = 1 if $opt{keepold};
 
 # --- connect to the database ---
@@ -193,7 +214,7 @@ my $dbh = DBI->connect("dbi:mysql:$dsn;mysql_read_default_group=mysqlhotcopy",
 if ( $opt{checkpoint} ) {
     $opt{checkpoint} = quote_names( $opt{checkpoint} );
     eval { $dbh->do( qq{ select time_stamp, src, dest, msg 
-			 from $opt{checkpoint} where 1 != 1} );
+       from $opt{checkpoint} where 1 != 1} );
        };
 
     die "Error accessing Checkpoint table ($opt{checkpoint}): $@"
@@ -205,7 +226,7 @@ if ( $opt{record_log_pos} ) {
     $opt{record_log_pos} = quote_names( $opt{record_log_pos} );
 
     eval { $dbh->do( qq{ select host, time_stamp, log_file, log_pos, master_host, master_log_file, master_log_pos
-			 from $opt{record_log_pos} where 1 != 1} );
+       from $opt{record_log_pos} where 1 != 1} );
        };
 
     die "Error accessing log_pos table ($opt{record_log_pos}): $@"
@@ -238,10 +259,6 @@ elsif (defined($tgt_name) && ($tgt_name =~ m:/: || $tgt_name eq '.')) {
 elsif ( $opt{suffix} ) {
     print "Using copy suffix '$opt{suffix}'\n" unless $opt{quiet};
 }
-elsif ( ($^O =~ m/^(NetWare)$/) && defined($tgt_name) && ($tgt_name =~ m:\\: || $tgt_name eq '.'))  
-{
-	$tgt_dirname = $tgt_name;
-}
 else
 {
   $tgt_name="" if (!defined($tgt_name));
@@ -258,21 +275,34 @@ if ( defined $opt{regexp} ) {
     my $sth_dbs = $dbh->prepare("show databases");
     $sth_dbs->execute;
     while ( my ($db_name) = $sth_dbs->fetchrow_array ) {
-	next if $db_name =~ m/^information_schema$/i;
-	push @db_desc, { 'src' => $db_name, 't_regex' => $t_regex } if ( $db_name =~ m/$opt{regexp}/o );
+  next if $db_name =~ m/^information_schema$/i;
+  push @db_desc, { 'src' => $db_name, 't_regex' => $t_regex } if ( $db_name =~ m/$opt{regexp}/o );
     }
 }
 
-# --- get list of tables to hotcopy ---
+# --- get list of tables and views to hotcopy ---
 
 my $hc_locks = "";
 my $hc_tables = "";
+my $hc_base_tables = "";
+my $hc_views = "";
+my $num_base_tables = 0;
+my $num_views = 0;
 my $num_tables = 0;
 my $num_files = 0;
 
 foreach my $rdb ( @db_desc ) {
     my $db = $rdb->{src};
-    my @dbh_tables = get_list_of_tables( $db );
+    my @dbh_base_tables = get_list_of_tables( $db );
+    my @dbh_views = get_list_of_views( $db );
+
+    ## filter out certain system non-lockable tables. 
+    ## keep in sync with mysqldump.
+    if ($db =~ m/^mysql$/i)
+    {
+      @dbh_base_tables = grep 
+        { !/^(apply_status|schema|general_log|slow_log)$/ } @dbh_base_tables
+    }
 
     ## generate regex for tables/files
     my $t_regex;
@@ -286,10 +316,19 @@ foreach my $rdb ( @db_desc ) {
 
         ## filter (out) tables specified in t_regex
         print "Filtering tables with '$t_regex'\n" if $opt{debug};
-        @dbh_tables = ( $negated 
-                        ? grep { $_ !~ $t_regex } @dbh_tables
-                        : grep { $_ =~ $t_regex } @dbh_tables );
+        @dbh_base_tables = ( $negated 
+                             ? grep { $_ !~ $t_regex } @dbh_base_tables
+                             : grep { $_ =~ $t_regex } @dbh_base_tables );
+
+        ## filter (out) views specified in t_regex
+        print "Filtering tables with '$t_regex'\n" if $opt{debug};
+        @dbh_views = ( $negated 
+                       ? grep { $_ !~ $t_regex } @dbh_views
+                       : grep { $_ =~ $t_regex } @dbh_views );
     }
+
+    ## Now concatenate the base table and view arrays.
+    my @dbh_tables = (@dbh_base_tables, @dbh_views);
 
     ## get list of files to copy
     my $db_dir = "$datadir/$db";
@@ -304,7 +343,7 @@ foreach my $rdb ( @db_desc ) {
     closedir( DBDIR );
 
     unless( keys %db_files ) {
-	warn "'$db' is an empty database\n";
+  warn "'$db' is an empty database\n";
     }
 
     ## filter (out) files specified in t_regex
@@ -325,20 +364,30 @@ foreach my $rdb ( @db_desc ) {
     ## remove indices unless we're told to keep them
     if ($opt{noindices}) {
         @index_files= grep { /\.(ISM|MYI)$/ } @db_files;
-	@db_files = grep { not /\.(ISM|MYI)$/ } @db_files;
+  @db_files = grep { not /\.(ISM|MYI)$/ } @db_files;
     }
 
     $rdb->{files}  = [ @db_files ];
     $rdb->{index}  = [ @index_files ];
-    my @hc_tables = map { quote_names("$db.$_") } @dbh_tables;
+    my @hc_base_tables = map { quote_names("$db.$_") } @dbh_base_tables;
+    my @hc_views = map { quote_names("$db.$_") } @dbh_views;
+    
+    my @hc_tables = (@hc_base_tables, @hc_views);
     $rdb->{tables} = [ @hc_tables ];
 
     $hc_locks .= ", "  if ( length $hc_locks && @hc_tables );
     $hc_locks .= join ", ", map { "$_ READ" } @hc_tables;
-    $hc_tables .= ", "  if ( length $hc_tables && @hc_tables );
-    $hc_tables .= join ", ", @hc_tables;
 
-    $num_tables += scalar @hc_tables;
+    $hc_base_tables .= ", "  if ( length $hc_base_tables && @hc_base_tables );
+    $hc_base_tables .= join ", ", @hc_base_tables;
+    $hc_views .= ", "  if ( length $hc_views && @hc_views );
+    $hc_views .= join " READ, ", @hc_views;
+
+    @hc_tables = (@hc_base_tables, @hc_views);
+
+    $num_base_tables += scalar @hc_base_tables;
+    $num_views += scalar @hc_views;
+    $num_tables += $num_base_tables + $num_views;
     $num_files  += scalar @{$rdb->{files}};
 }
 
@@ -354,24 +403,23 @@ if (defined($tgt_name) && length $tgt_name ) {
     if ($to_other_database)
     {
       foreach my $rdb ( @db_desc ) {
-	$rdb->{target} = "$tgt_dirname";
+  $rdb->{target} = "$tgt_dirname";
       }
     }
     elsif ($opt{method} =~ /^scp\b/) 
     {   # we have to trust scp to hit the target
-	foreach my $rdb ( @db_desc ) {
-	    $rdb->{target} = "$tgt_dirname/$rdb->{src}";
-	}
+  foreach my $rdb ( @db_desc ) {
+      $rdb->{target} = "$tgt_dirname/$rdb->{src}";
+  }
     }
     else
     {
       die "Last argument ($tgt_dirname) is not a directory\n"
-	if (!(-e $tgt_dirname && -d $tgt_dirname ) );
+  if (!(-e $tgt_dirname && -d $tgt_dirname ) );
       foreach my $rdb ( @db_desc ) {
-	$rdb->{target} = "$tgt_dirname/$rdb->{src}";
-
-	# man rsync for significance of trailing /  --- mengwong 20010402
-	for ($rdb->{target}) { $_ .= "/" if not /\/$/ and $opt{method} eq "rsync" }
+        $rdb->{target} = "$tgt_dirname/$rdb->{src}";
+        # man rsync for significance of trailing /  --- mengwong 20010402
+        for ($rdb->{target}) { $_ .= "/" if not /\/$/ and $opt{method} eq "rsync" }
       }
     }
   }
@@ -395,7 +443,6 @@ my @existing = ();
 
 # method=rsync overwrites existing files, so no need to rmdir / mkdir.
 unless ($opt{method} eq "rsync") {
-
   if ($opt{method} =~ /^cp\b/)
   {
     foreach my $rdb ( @db_desc ) {
@@ -425,11 +472,8 @@ unless ($opt{method} eq "rsync") {
       else {
           mkdir($tgt_dirpath, 0750) or die "Can't create '$tgt_dirpath': $!\n"
               unless -d $tgt_dirpath;
-          if ($^O !~ m/^(NetWare)$/)  
-          {
-              my @f_info= stat "$datadir/$rdb->{src}";
-              chown $f_info[4], $f_info[5], $tgt_dirpath;
-          }
+          my @f_info= stat "$datadir/$rdb->{src}";
+          chown $f_info[4], $f_info[5], $tgt_dirpath;
       }
   }
 }
@@ -448,36 +492,63 @@ if ( $opt{checkpoint} || $opt{record_log_pos} ) {
   # convert existing READ lock on checkpoint and/or log_pos table into WRITE lock
   foreach my $table ( grep { defined } ( $opt{checkpoint}, $opt{record_log_pos} ) ) {
     $hc_locks .= ", $table WRITE" 
-	unless ( $hc_locks =~ s/$table\s+READ/$table WRITE/ );
+  unless ( $hc_locks =~ s/$table\s+READ/$table WRITE/ );
   }
 }
 
-my $hc_started = time;	# count from time lock is granted
+my $hc_started = time;  # count from time lock is granted
 
 if ( $opt{dryrun} ) {
-    print "LOCK TABLES $hc_locks\n";
-    print "FLUSH TABLES /*!32323 $hc_tables */\n";
+    if ( $opt{old_server} ) {
+        print "LOCK TABLES $hc_locks\n";
+        print "FLUSH TABLES /*!32323 $hc_tables */\n";
+    }
+    else {
+        # Lock base tables and views separately.
+        print "FLUSH TABLES $hc_base_tables WITH READ LOCK\n"
+          if ( $hc_base_tables );
+        print "LOCK TABLES $hc_views READ\n" if ( $hc_views );
+    }
+    
     print "FLUSH LOGS\n" if ( $opt{flushlog} );
     print "RESET MASTER\n" if ( $opt{resetmaster} );
     print "RESET SLAVE\n" if ( $opt{resetslave} );
 }
 else {
     my $start = time;
-    $dbh->do("LOCK TABLES $hc_locks");
-    printf "Locked $num_tables tables in %d seconds.\n", time-$start unless $opt{quiet};
-    $hc_started = time;	# count from time lock is granted
+    if ( $opt{old_server} ) {
+        $dbh->do("LOCK TABLES $hc_locks");
+        printf "Locked $num_tables tables in %d seconds.\n", time-$start unless $opt{quiet};
+        $hc_started = time; # count from time lock is granted
 
-    # flush tables to make on-disk copy up to date
-    $start = time;
-    $dbh->do("FLUSH TABLES /*!32323 $hc_tables */");
-    printf "Flushed tables ($hc_tables) in %d seconds.\n", time-$start unless $opt{quiet};
+        # flush tables to make on-disk copy up to date
+        $start = time;
+        $dbh->do("FLUSH TABLES /*!32323 $hc_tables */");
+        printf "Flushed tables ($hc_tables) in %d seconds.\n", time-$start unless $opt{quiet};
+    }
+    else {
+        # Lock base tables and views separately, as 'FLUSH TABLES <tbl_name>
+        # ... WITH READ LOCK' (introduced in 5.5) would fail for views.
+        # Also, flush tables to make on-disk copy up to date
+        $dbh->do("FLUSH TABLES $hc_base_tables WITH READ LOCK")
+          if ( $hc_base_tables );
+        printf "Flushed $num_base_tables tables with read lock ($hc_base_tables) in %d seconds.\n",
+               time-$start unless $opt{quiet};
+
+        $start = time;
+        $dbh->do("LOCK TABLES $hc_views READ") if ( $hc_views );
+        printf "Locked $num_views views ($hc_views) in %d seconds.\n",
+               time-$start unless $opt{quiet};
+
+        $hc_started = time; # count from time lock is granted
+    }
     $dbh->do( "FLUSH LOGS" ) if ( $opt{flushlog} );
     $dbh->do( "RESET MASTER" ) if ( $opt{resetmaster} );
     $dbh->do( "RESET SLAVE" ) if ( $opt{resetslave} );
 
     if ( $opt{record_log_pos} ) {
-	record_log_pos( $dbh, $opt{record_log_pos} );
-	$dbh->do("FLUSH TABLES /*!32323 $hc_tables */");
+  record_log_pos( $dbh, $opt{record_log_pos} );
+  $dbh->do("FLUSH TABLES /*!32323 $hc_tables */");
     }
 }
 
@@ -496,7 +567,7 @@ foreach my $rdb ( @db_desc )
   if ($rdb->{index})
   {
     copy_index($opt{method}, \@files,
-	       "$datadir/$rdb->{src}", $rdb->{target} );
+         "$datadir/$rdb->{src}", $rdb->{target} );
   }
   
   if ( $opt{checkpoint} ) {
@@ -504,8 +575,8 @@ foreach my $rdb ( @db_desc )
     
     eval {
       $dbh->do( qq{ insert into $opt{checkpoint} (src, dest, msg) 
-		      VALUES ( '$rdb->{src}', '$rdb->{target}', '$msg' )
-		    } ); 
+          VALUES ( '$rdb->{src}', '$rdb->{target}', '$msg' )
+        } ); 
     };
     
     if ( $@ ) {
@@ -517,8 +588,8 @@ foreach my $rdb ( @db_desc )
 if ( $opt{dryrun} ) {
     print "UNLOCK TABLES\n";
     if ( @existing && !$opt{keepold} ) {
-	my @oldies = map { $_ . '_old' } @existing;
-	print "rm -rf @oldies\n" 
+  my @oldies = map { $_ . '_old' } @existing;
+  print "rm -rf @oldies\n" 
     }
     $dbh->disconnect();
     exit(0);
@@ -550,11 +621,11 @@ if ( @failed ) {
     print "Deleting @targets \n" if $opt{debug};
     rmtree([@targets]);
     if (@existing) {
-	print "Restoring @existing from back-up\n" if $opt{debug};
+  print "Restoring @existing from back-up\n" if $opt{debug};
         foreach my $dir ( @existing ) {
-	    rename("${dir}_old", $dir )
-	      or warn "Can't rename ${dir}_old to $dir: $!\n";
-	}
+      rename("${dir}_old", $dir )
+        or warn "Can't rename ${dir}_old to $dir: $!\n";
+  }
     }
 
     die join( "\n", @failed );
@@ -564,15 +635,15 @@ else {
     # delete _old unless $opt{keepold}
 
     if ( @existing && !$opt{keepold} ) {
-	my @oldies = map { $_ . '_old' } @existing;
-	print "Deleting previous copy in @oldies\n" if $opt{debug};
-	rmtree([@oldies]);
+  my @oldies = map { $_ . '_old' } @existing;
+  print "Deleting previous copy in @oldies\n" if $opt{debug};
+  rmtree([@oldies]);
     }
 
     printf "$0 copied %d tables (%d files) in %d second%s (%d seconds overall).\n",
-	    $num_tables, $num_files,
-	    $hc_dur, ($hc_dur==1)?"":"s", time - $start_time
-	unless $opt{quiet};
+      $num_tables, $num_files,
+      $hc_dur, ($hc_dur==1)?"":"s", time - $start_time
+  unless $opt{quiet};
 }
 
 exit 0;
@@ -585,42 +656,35 @@ sub copy_files {
     my @cmd;
     print "Copying ".@$files." files...\n" unless $opt{quiet};
 
-    if ($^O =~ m/^(NetWare)$/)  # on NetWare call PERL copy (slower)
+    if ($method =~ /^s?cp\b/)  # cp or scp with optional flags
     {
-      foreach my $file ( @$files )
-      {
-        copy($file, $target."/".basename($file));
-      }
-    }
-    elsif ($method =~ /^s?cp\b/)  # cp or scp with optional flags
-    {
-	my $cp = $method;
-	# add option to preserve mod time etc of copied files
-	# not critical, but nice to have
-	$cp.= " -p" if $^O =~ m/^(solaris|linux|freebsd|darwin)$/;
+      my $cp = $method;
+      # add option to preserve mod time etc of copied files
+      # not critical, but nice to have
+      $cp.= " -p" if $^O =~ m/^(solaris|linux|freebsd|darwin)$/;
 
-	# add recursive option for scp
-	$cp.= " -r" if $^O =~ /m^(solaris|linux|freebsd|darwin)$/ && $method =~ /^scp\b/;
+      # add recursive option for scp
+      $cp.= " -r" if $^O =~ /m^(solaris|linux|freebsd|darwin)$/ && $method =~ /^scp\b/;
 
-	# perform the actual copy
-	safe_system( $cp, (map { "'$_'" } @$files), "'$target'" );
+      # perform the actual copy
+      safe_system( $cp, (map { "'$_'" } @$files), "'$target'" );
     }
-    elsif ($method eq "rsync") { # rsync --- but locally
-  my $cp = $method;
-  # use the rsync archive mode for the copied files
-  $cp.= " -a" if $^O =~ m/^(solaris|linux|freebsd|darwin)$/;
-  safe_system( $cp, (map { "'$_'" } @$files), "'$target'" );
- 
+    elsif ($method eq "rsync") { # rsync --- but locally                                                                                                                                                        
+      my $cp = $method;
+      # use the rsync archive mode for the copied files
+      $cp.= " -a" if $^O =~ m/^(solaris|linux|freebsd|darwin)$/;
+      $cp.= " -v" if $opt{debug};
+      safe_system( $cp, (map { "'$_'" } @$files), "'$target'" );
     }
     else
-    {
-	die "Can't use unsupported method '$method'\n";
+    { 
+      die "Can't use unsupported method '$method'\n";
     }
 }
 
 #
 # Copy only the header of the index file
-# 
+#
 
 sub copy_index
 {
@@ -638,38 +702,36 @@ sub copy_index
     die "Can't read index header from $from\n" if ($length < 1024);
     close INPUT;
     
-    my $filesize = -s $from;
-
     if ( $opt{dryrun} )
     {
-      print "$opt{method}-header $from $to (will copy only $length bytes of $filesize)\n";
+      print "$opt{method}-header $from $to\n";
     }
     elsif ($opt{method} eq 'cp')
     {
       open(OUTPUT,">$to")   || die "Can\'t create file $to: $!\n";
       if (syswrite(OUTPUT,$buff) != length($buff))
       {
-	die "Error when writing data to $to: $!\n";
+        die "Error when writing data to $to: $!\n";
       }
-      close OUTPUT	   || die "Error on close of $to: $!\n";
+      close OUTPUT     || die "Error on close of $to: $!\n";
     }
-    elsif ($opt{method} eq 'rsync')
+    elsif ($opt{method} eq 'rsync')                                                                                                                                                                             
     {
       # doing the same as with cp actually
       open(OUTPUT,">$to")   || die "Can\'t create file $to: $!\n";
       if (syswrite(OUTPUT,$buff) != length($buff))
       {
-  die "Error when writing data to $to: $!\n";
+        die "Error when writing data to $to: $!\n";
       }
       close OUTPUT     || die "Error on close of $to: $!\n";
     }
     elsif ($opt{method} =~ /^scp\b/)
     {
       my ($fh, $tmp)= tempfile('mysqlhotcopy-XXXXXX', DIR => $opt_tmpdir) or
-	die "Can\'t create/open file in $opt_tmpdir\n";
+      die "Can\'t create/open file in $opt_tmpdir\n";
       if (syswrite($fh,$buff) != length($buff))
       {
-	die "Error when writing data to $tmp: $!\n";
+        die "Error when writing data to $tmp: $!\n";
       }
       close $fh || die "Error on close of $tmp: $!\n";
       safe_system("$opt{method} $tmp $to");
@@ -735,20 +797,20 @@ sub retire_directory {
     my ( @dir ) = @_;
 
     foreach my $dir ( @dir ) {
-	my $tgt_oldpath = $dir . '_old';
-	if ( $opt{dryrun} ) {
-	    print "rmtree $tgt_oldpath\n" if ( -d $tgt_oldpath );
-	    print "rename $dir, $tgt_oldpath\n";
-	    next;
-	}
+  my $tgt_oldpath = $dir . '_old';
+  if ( $opt{dryrun} ) {
+      print "rmtree $tgt_oldpath\n" if ( -d $tgt_oldpath );
+      print "rename $dir, $tgt_oldpath\n";
+      next;
+  }
 
-	if ( -d $tgt_oldpath ) {
-	    print "Deleting previous 'old' hotcopy directory ('$tgt_oldpath')\n" unless $opt{quiet};
-	    rmtree([$tgt_oldpath],0,1);
-	}
-	rename($dir, $tgt_oldpath)
-	  or die "Can't rename $dir=>$tgt_oldpath: $!\n";
-	print "Existing hotcopy directory renamed to '$tgt_oldpath'\n" unless $opt{quiet};
+  if ( -d $tgt_oldpath ) {
+      print "Deleting previous 'old' hotcopy directory ('$tgt_oldpath')\n" unless $opt{quiet};
+      rmtree([$tgt_oldpath],0,1);
+  }
+  rename($dir, $tgt_oldpath)
+    or die "Can't rename $dir=>$tgt_oldpath: $!\n";
+  print "Existing hotcopy directory renamed to '$tgt_oldpath'\n" unless $opt{quiet};
     }
 }
 
@@ -756,31 +818,31 @@ sub record_log_pos {
     my ( $dbh, $table_name ) = @_;
 
     eval {
-	my ($file,$position) = get_row( $dbh, "show master status" );
-	die "master status is undefined" if !defined $file || !defined $position;
-	
-	my $row_hash = get_row_hash( $dbh, "show slave status" );
-	my ($master_host, $log_file, $log_pos ); 
-	if ( $dbh->{mysql_serverinfo} =~ /^3\.23/ ) {
-	    ($master_host, $log_file, $log_pos ) 
-	      = @{$row_hash}{ qw / Master_Host Log_File Pos / };
-	} else {
-	    ($master_host, $log_file, $log_pos ) 
-	      = @{$row_hash}{ qw / Master_Host Relay_Master_Log_File Exec_Master_Log_Pos / };
-	}
-	my $hostname = hostname();
-	
-	$dbh->do( qq{ replace into $table_name 
-			  set host=?, log_file=?, log_pos=?, 
+  my ($file,$position) = get_row( $dbh, "show master status" );
+  die "master status is undefined" if !defined $file || !defined $position;
+  
+  my $row_hash = get_row_hash( $dbh, "show slave status" );
+  my ($master_host, $log_file, $log_pos ); 
+  if ( $dbh->{mysql_serverinfo} =~ /^3\.23/ ) {
+      ($master_host, $log_file, $log_pos ) 
+        = @{$row_hash}{ qw / Master_Host Log_File Pos / };
+  } else {
+      ($master_host, $log_file, $log_pos ) 
+        = @{$row_hash}{ qw / Master_Host Relay_Master_Log_File Exec_Master_Log_Pos / };
+  }
+  my $hostname = hostname();
+  
+  $dbh->do( qq{ replace into $table_name 
+        set host=?, log_file=?, log_pos=?, 
                           master_host=?, master_log_file=?, master_log_pos=? }, 
-		  undef, 
-		  $hostname, $file, $position, 
-		  $master_host, $log_file, $log_pos  );
-	
+      undef, 
+      $hostname, $file, $position, 
+      $master_host, $log_file, $log_pos  );
+  
     };
     
     if ( $@ ) {
-	warn "Failed to store master position: $@\n";
+  warn "Failed to store master position: $@\n";
     }
 }
 
@@ -805,12 +867,27 @@ sub get_list_of_tables {
 
     my $tables =
         eval {
-            $dbh->selectall_arrayref('SHOW TABLES FROM ' .
-                                     $dbh->quote_identifier($db))
+            $dbh->selectall_arrayref('SHOW FULL TABLES FROM ' .
+                                     $dbh->quote_identifier($db) .
+                                     ' WHERE Table_type = \'BASE TABLE\'')
         } || [];
     warn "Unable to retrieve list of tables in $db: $@" if $@;
 
     return (map { $_->[0] } @$tables);
+}
+
+sub get_list_of_views {
+    my ( $db ) = @_;
+
+    my $views =
+        eval {
+            $dbh->selectall_arrayref('SHOW FULL TABLES FROM ' .
+                                     $dbh->quote_identifier($db) .
+                                     ' WHERE Table_type = \'VIEW\'')
+        } || [];
+    warn "Unable to retrieve list of views in $db: $@" if $@;
+
+    return (map { $_->[0] } @$views);
 }
 
 sub quote_names {
@@ -1008,6 +1085,10 @@ when using the --host option.
 
 UNIX domain socket to use when connecting to local server.
 
+=item --old_server
+
+Use old server (pre v5.5) commands.
+
 =item  --noindices          
 
 Don\'t include index files in copy. Only up to the first 2048 bytes
@@ -1025,6 +1106,11 @@ The destination directory _must exist_ on the target machine using the
 scp method. --keepold and --allowold are meaningless with scp.
 Liberal use of the --debug option will help you figure out what\'s
 really going on when you do an scp.
+
+Note that using scp will lock your tables for a _long_ time unless
+your network connection is _fast_. If this is unacceptable to you,
+use the 'cp' method to copy the tables to some temporary area and then
+scp or rsync the files at your leisure.
 
 Note that using scp will lock your tables for a _long_ time unless
 your network connection is _fast_. If this is unacceptable to you,
@@ -1100,7 +1186,7 @@ Emil S. Hansen - Added resetslave and resetmaster.
 
 20010402 Meng Weng Wong <mengwong@pobox.com>
 
-    added --method=rsync for when you want to update a previously
+    added --method=rsync for when you want to update a previously                                                                                                                                               
     made hotcopy.
 
 Jeremy D. Zawodny - Removed deprecated DBI calls.  Fixed bug which
@@ -1114,4 +1200,6 @@ Paul DuBois - Remove end '/' from directory names.
 20121019 Hans Raaf <hara@oderwat.de>
 
     Made Meng Weng Wongs modifications into my current mysqlhotcopy version
-    and added that --noindices is working with method=rsync
+    and added that --noindices is working with method=rsync          
+
+Erik Osterman - Merged patches from Meng Weng Wong into the newer version of mysqlhotcopy that appears in 5.6.24-1debian7 as of 2015/05/21
